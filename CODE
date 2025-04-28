@@ -1,0 +1,431 @@
+
+import numpy as np
+import pandas as pd
+import gym
+from gym import spaces
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.distributions import Categorical
+from torch.nn.utils import clip_grad_norm_
+import yfinance as yf
+from sklearn.preprocessing import MinMaxScaler
+import matplotlib.pyplot as plt
+
+
+class GeneticAlgorithm:
+    """Simplified genetic algorithm for strategy evolution"""
+    def __init__(self, mutation_rate=0.1):
+        self.mutation_rate = mutation_rate
+
+    def evolve(self, policy, fitness):
+        """Apply mutation to policy weights based on fitness"""
+        for param in policy.parameters():
+            if np.random.rand() < self.mutation_rate:
+                mutation_strength = 0.1 * (1 - fitness/1000)
+                noise = torch.randn_like(param) * mutation_strength
+                param.data += noise
+        return policy
+
+
+class SymbolicReasoner:
+    """Generates human-readable explanations for trading decisions"""
+    def generate_explanation(self, state, action, current_price):
+        """Create explanation based on technical indicators"""
+
+        last_state = state[-1]
+        close_price = float(last_state[3])
+        volume = float(last_state[4])
+        rsi = float(last_state[5]) if len(last_state) > 5 else 50.0
+        sma_20 = float(last_state[6]) if len(last_state) > 6 else close_price
+        macd = float(last_state[7]) if len(last_state) > 7 else 0.0
+        volume_ma = float(last_state[8]) if len(last_state) > 8 else volume
+
+        reasons = []
+        if action == 1:  # Buy
+            if rsi < 30:
+                reasons.append(f"RSI({rsi:.1f}) indicates oversold")
+            if close_price < sma_20 * 0.98:
+                reasons.append(f"Price below 20-day SMA({sma_20:.2f})")
+            if macd > 0:
+                reasons.append(f"MACD bullish({macd:.2f})")
+            if volume > volume_ma * 1.5:
+                reasons.append(f"High volume({volume:.0f} vs MA {volume_ma:.0f})")
+            return "BUY: " + ", ".join(reasons) if reasons else "BUY: Neural network signal"
+
+        elif action == 2:  # Sell
+            if rsi > 70:
+                reasons.append(f"RSI({rsi:.1f}) indicates overbought")
+            if close_price > sma_20 * 1.02:
+                reasons.append(f"Price above 20-day SMA({sma_20:.2f})")
+            if macd < 0:
+                reasons.append(f"MACD bearish({macd:.2f})")
+            if volume > volume_ma * 1.5:
+                reasons.append(f"High volume({volume:.0f} vs MA {volume_ma:.0f})")
+            return "SELL: " + ", ".join(reasons) if reasons else "SELL: Neural network signal"
+
+        return "HOLD: No strong signals detected"
+
+
+class MarketEnvironment(gym.Env):
+    """Custom trading environment with robust initialization"""
+    def __init__(self, data, initial_balance=10000, window_size=20):
+        super(MarketEnvironment, self).__init__()
+
+
+        self.window_size = window_size
+        self.initial_balance = initial_balance
+
+
+        self.data = self._validate_data(data.copy(), window_size)
+
+
+        self.current_step = window_size
+        self.balance = initial_balance
+        self.positions = []
+        self.portfolio_value = []
+
+
+        self.action_space = spaces.Discrete(3)
+
+
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf,
+            shape=(window_size, 9), dtype=np.float32)
+
+    def _validate_data(self, data, window_size):
+        """Ensure data is valid and contains no zeros in price columns"""
+
+        price_cols = ['Open', 'High', 'Low', 'Close']
+        for col in price_cols:
+            data[col] = data[col].replace(0, np.nan).ffill()
+
+
+        data = data.dropna()
+
+
+        data['rsi'] = self._calculate_rsi(data['Close'])
+        data['sma_20'] = data['Close'].rolling(20).mean()
+        data['macd'] = self._calculate_macd(data['Close'])
+        data['volume_ma'] = data['Volume'].rolling(20).mean()
+
+
+        data.bfill(inplace=True)
+        data.ffill(inplace=True)
+
+
+        if len(data) < window_size * 2:
+            raise ValueError(f"Need at least {window_size * 2} data points, got {len(data)}")
+
+        return data
+
+    def _get_observation(self):
+        """Get current market observation with fixed features"""
+        obs = self.data.iloc[
+            self.current_step-self.window_size:self.current_step].copy()
+
+
+        obs = obs[['Open', 'High', 'Low', 'Close', 'Volume',
+                  'rsi', 'sma_20', 'macd', 'volume_ma']].values
+
+        return obs.astype(np.float32)
+
+    def _calculate_rsi(self, prices, period=14):
+        """Calculate Relative Strength Index with zero division protection"""
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+
+
+        rs = np.where(loss != 0, gain / loss, 1)
+        return 100 - (100 / (1 + rs))
+
+    def _calculate_macd(self, prices, fast=12, slow=26, signal=9):
+        """Calculate MACD indicator"""
+        ema_fast = prices.ewm(span=fast).mean()
+        ema_slow = prices.ewm(span=slow).mean()
+        macd = ema_fast - ema_slow
+        signal_line = macd.ewm(span=signal).mean()
+        return macd - signal_line
+
+    def reset(self):
+        """Reset the environment"""
+        self.current_step = self.window_size
+        self.balance = self.initial_balance
+        self.positions = []
+        self.portfolio_value = [self.initial_balance]
+        return self._get_observation()
+
+    def step(self, action):
+        """Execute one trading step with robust price handling"""
+        current_price = float(self.data.iloc[self.current_step]['Close'])
+        done = self.current_step >= len(self.data) - 1
+
+
+        if current_price <= 0:
+            return self._get_observation(), 0, done, {
+                'current_price': current_price,
+                'balance': self.balance,
+                'portfolio_value': self.portfolio_value[-1],
+                'positions': len(self.positions),
+                'explanation': "Invalid price - trade skipped"
+            }
+
+        reward = 0
+        explanation = ""
+
+
+        if action == 1:  # Buy
+            position_size = min(self.balance, self.balance * 0.1)
+            shares = position_size / current_price
+            self.positions.append({
+                'shares': shares,
+                'entry_price': current_price,
+                'entry_step': self.current_step
+            })
+            self.balance -= position_size
+            explanation = f"Bought {shares:.2f} shares at {current_price:.2f}"
+
+        elif action == 2:  # Sell
+            if self.positions:
+                position = self.positions.pop()
+                profit = (current_price - position['entry_price']) * position['shares']
+                self.balance += position['shares'] * current_price
+                reward = profit
+                explanation = f"Sold {position['shares']:.2f} shares at {current_price:.2f}"
+
+
+        portfolio_value = self.balance
+        for pos in self.positions:
+            portfolio_value += pos['shares'] * current_price
+        self.portfolio_value.append(portfolio_value)
+
+
+        if action != 2:
+            reward = portfolio_value - self.portfolio_value[-2] if len(self.portfolio_value) > 1 else 0
+
+        info = {
+            'current_price': current_price,
+            'balance': self.balance,
+            'portfolio_value': portfolio_value,
+            'positions': len(self.positions),
+            'explanation': explanation
+        }
+
+        self.current_step += 1
+        return self._get_observation(), reward, done, info
+
+
+class PolicyNetwork(nn.Module):
+    """Neural network policy with stable initialization"""
+    def __init__(self, input_size, hidden_size=64):
+        super(PolicyNetwork, self).__init__()
+        self.input_size = input_size
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.fc3 = nn.Linear(hidden_size, 3)  # 3 actions
+
+
+        for layer in [self.fc1, self.fc2, self.fc3]:
+            nn.init.xavier_uniform_(layer.weight)
+            nn.init.constant_(layer.bias, 0.0)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        x = torch.softmax(self.fc3(x), dim=-1)
+
+
+        x = torch.clamp(x, min=1e-8, max=1.0-1e-8)
+        return x
+
+
+class NeuroSymbolicTradingSystem:
+    """Complete trading system with stable training"""
+    def __init__(self, data):
+        self.raw_data = data.copy()
+        self.data = self._prepare_data()
+        self.env = MarketEnvironment(self.data)
+        self.input_size = self.env.observation_space.shape[0] * self.env.observation_space.shape[1]
+        self.policy = PolicyNetwork(self.input_size)
+
+
+        self.optimizer = optim.Adam(self.policy.parameters(), lr=0.0001)
+        self.symbolic_reasoner = SymbolicReasoner()
+        self.genetic_algorithm = GeneticAlgorithm()
+
+
+        self.nan_count = 0
+
+    def _prepare_data(self):
+        """Prepare and normalize market data with robust validation"""
+        data = self.raw_data[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+
+
+        price_cols = ['Open', 'High', 'Low', 'Close']
+        for col in price_cols:
+            data[col] = data[col].replace(0, np.nan).ffill()
+
+
+        data = data.dropna()
+
+
+        data['rsi'] = self._calculate_rsi(data['Close'])
+        data['sma_20'] = data['Close'].rolling(20).mean()
+        data['macd'] = self._calculate_macd(data['Close'])
+        data['volume_ma'] = data['Volume'].rolling(20).mean()
+
+        # Handle NA values
+        data.bfill(inplace=True)
+        data.ffill(inplace=True)
+
+        # Normalize
+        scaler = MinMaxScaler()
+        data[data.columns] = scaler.fit_transform(data)
+
+        return data
+
+    def _calculate_rsi(self, prices, period=14):
+        """Helper for RSI calculation with zero division protection"""
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+
+        # Avoid division by zero
+        rs = np.where(loss != 0, gain / loss, 1)
+        return 100 - (100 / (1 + rs))
+
+    def _calculate_macd(self, prices, fast=12, slow=26, signal=9):
+        """Helper for MACD calculation"""
+        ema_fast = prices.ewm(span=fast).mean()
+        ema_slow = prices.ewm(span=slow).mean()
+        macd = ema_fast - ema_slow
+        signal_line = macd.ewm(span=signal).mean()
+        return macd - signal_line
+
+    def train(self, episodes=1):
+      """Train the trading agent with full NaN handling"""
+      rewards_history = []
+
+      for episode in range(episodes):
+        state = self.env.reset()
+        done = False
+        total_reward = 0
+
+        while not done:
+
+            state_tensor = torch.FloatTensor(state.flatten()).unsqueeze(0)
+            if not torch.isfinite(state_tensor).all():
+                print("⚠️ Non-finite state detected, replacing with zeros")
+                state_tensor[~torch.isfinite(state_tensor)] = 0.0
+
+            if state_tensor.shape[1] != self.input_size:
+                raise ValueError(f"Expected input size {self.input_size}, got {state_tensor.shape[1]}")
+
+            try:
+                probs = self.policy(state_tensor)
+
+
+                if not torch.isfinite(probs).all() or torch.isnan(probs).any():
+                    raise ValueError("Policy output contains invalid values (NaN/Inf)")
+
+            except Exception as e:
+                print(f"⚠️ Error in policy forward pass: {e}")
+                self.nan_count += 1
+                if self.nan_count > 10:
+                    raise RuntimeError("Too many NaN values detected in probabilities")
+                state = self.env.reset()
+                continue
+
+
+            if torch.isnan(probs).any():
+                print("⚠️ NaNs in probs, falling back to uniform distribution")
+                probs = torch.ones((1, 3)) / 3.0
+
+            dist = Categorical(probs)
+            action = dist.sample()
+
+
+            next_state, reward, done, info = self.env.step(action.item())
+
+
+            advantage = reward
+            loss = -dist.log_prob(action) * advantage
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
+            self.optimizer.step()
+
+            total_reward += reward
+            state = next_state
+
+
+        if episode % 10 == 0:
+            self.genetic_algorithm.evolve(self.policy, total_reward)
+
+        rewards_history.append(total_reward)
+        if episode % 10 == 0:
+            print(f"Episode {episode}, Reward: {total_reward:.2f}, NaN Count: {self.nan_count}")
+
+
+            plt.plot(rewards_history)
+            plt.title("Training Progress")
+            plt.xlabel("Episode")
+            plt.ylabel("Total Reward")
+            plt.grid(True)
+            plt.show()
+
+
+    def evaluate(self):
+        """Evaluate the trained model"""
+        state = self.env.reset()
+        done = False
+        portfolio_values = []
+        explanations = []
+
+        while not done:
+            state_tensor = torch.FloatTensor(state.flatten()).unsqueeze(0)
+            with torch.no_grad():
+                probs = self.policy(state_tensor)
+                action = torch.argmax(probs).item()
+
+            next_state, _, done, info = self.env.step(action)
+
+
+            explanation = self.symbolic_reasoner.generate_explanation(
+                state, action, info['current_price'])
+            explanations.append(explanation)
+
+            portfolio_values.append(info['portfolio_value'])
+            state = next_state
+
+
+        plt.figure(figsize=(12, 6))
+        plt.plot(portfolio_values)
+        plt.title("Portfolio Value Over Time")
+        plt.xlabel("Step")
+        plt.ylabel("Value ($)")
+        plt.grid()
+        plt.show()
+
+        print("\nSample Explanations:")
+        for i in range(0, len(explanations), len(explanations)//5):
+            print(f"Step {i}: {explanations[i]}")
+
+        return portfolio_values, explanations
+
+
+if __name__ == "__main__":
+    print("Loading market data...")
+    data = yf.download("GOOG", start="2020-01-01", end="2023-01-01")
+    data.reset_index(inplace=True)
+
+    print("Initializing trading system...")
+    trading_system = NeuroSymbolicTradingSystem(data)
+
+    print("Training model (this may take a few minutes)...")
+
+
+    print("\nEvaluating performance...")
+    portfolio_values, explanations = trading_system.evaluate()
